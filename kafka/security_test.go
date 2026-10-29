@@ -17,6 +17,7 @@ limitations under the License.
 package kafka
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -27,10 +28,13 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 func TestConfigureSecurity_Plaintext(t *testing.T) {
@@ -174,6 +178,104 @@ func TestConfigureSASL_SCRAM512(t *testing.T) {
 	}
 	if config.Net.SASL.SCRAMClientGeneratorFunc == nil {
 		t.Error("SCRAMClientGeneratorFunc should be set")
+	}
+}
+
+func TestConfigureSecurity_ProtocolCaseInsensitive(t *testing.T) {
+	// A lowercase protocol must be accepted, just like the uppercase form.
+	t.Setenv("KAFKA_SECURITY_PROTOCOL", "sasl_ssl")
+	t.Setenv("KAFKA_SASL_MECHANISM", "PLAIN")
+	t.Setenv("KAFKA_SASL_USER", "alice")
+	t.Setenv("KAFKA_SASL_PASSWORD", "s3cret")
+
+	config := sarama.NewConfig()
+	if err := configureSecurity(config); err != nil {
+		t.Fatalf("lowercase protocol should be accepted: %v", err)
+	}
+	if !config.Net.TLS.Enable {
+		t.Error("TLS should be enabled for sasl_ssl")
+	}
+	if !config.Net.SASL.Enable {
+		t.Error("SASL should be enabled for sasl_ssl")
+	}
+}
+
+func TestConfigureSASL_MechanismCaseInsensitive(t *testing.T) {
+	// A lowercase mechanism must be accepted, just like the uppercase form.
+	t.Setenv("KAFKA_SASL_MECHANISM", "scram-sha-256")
+	t.Setenv("KAFKA_SASL_USER", "u")
+	t.Setenv("KAFKA_SASL_PASSWORD", "p")
+
+	config := sarama.NewConfig()
+	if err := configureSASL(config); err != nil {
+		t.Fatalf("lowercase mechanism should be accepted: %v", err)
+	}
+	if config.Net.SASL.Mechanism != sarama.SASLTypeSCRAMSHA256 {
+		t.Errorf("mechanism = %v, want SCRAM-SHA-256", config.Net.SASL.Mechanism)
+	}
+}
+
+func TestConfigureSecurity_WarnsOnInsecureFallback(t *testing.T) {
+	// Protocol unset but auth vars present: the connection silently falls back to
+	// cleartext, so a warning must be emitted naming the ignored vars.
+	t.Setenv("KAFKA_SECURITY_PROTOCOL", "")
+	t.Setenv("KAFKA_SASL_USER", "alice")
+	t.Setenv("KAFKA_SASL_PASSWORD", "s3cret")
+
+	var buf bytes.Buffer
+	restore := log.Logger
+	log.Logger = zerolog.New(&buf)
+	defer func() { log.Logger = restore }()
+
+	config := sarama.NewConfig()
+	if err := configureSecurity(config); err != nil {
+		t.Fatal(err)
+	}
+	// Still PLAINTEXT -- the warning does not change the (insecure) behavior.
+	if config.Net.TLS.Enable || config.Net.SASL.Enable {
+		t.Error("expected PLAINTEXT fallback (no TLS/SASL) when protocol is unset")
+	}
+	out := buf.String()
+	if !strings.Contains(out, "KAFKA_SECURITY_PROTOCOL is unset") {
+		t.Errorf("expected an insecure-fallback warning, got: %q", out)
+	}
+	if !strings.Contains(out, "KAFKA_SASL_USER") {
+		t.Errorf("warning should name the ignored auth var, got: %q", out)
+	}
+}
+
+func TestConfigureSecurity_NoWarnWhenNoAuthVars(t *testing.T) {
+	// Protocol unset and no auth vars: PLAINTEXT is the intended default, so no
+	// warning should be emitted.
+	t.Setenv("KAFKA_SECURITY_PROTOCOL", "")
+	for _, v := range securityEnvVars {
+		t.Setenv(v, "")
+	}
+
+	var buf bytes.Buffer
+	restore := log.Logger
+	log.Logger = zerolog.New(&buf)
+	defer func() { log.Logger = restore }()
+
+	config := sarama.NewConfig()
+	if err := configureSecurity(config); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "KAFKA_SECURITY_PROTOCOL is unset") {
+		t.Errorf("did not expect a warning when no auth vars are set, got: %q", buf.String())
+	}
+}
+
+func TestSetSecurityEnvVars(t *testing.T) {
+	for _, v := range securityEnvVars {
+		t.Setenv(v, "")
+	}
+	t.Setenv("KAFKA_SASL_USER", "alice")
+	t.Setenv("KAFKA_TLS_SKIP_VERIFY", "  ") // whitespace-only counts as unset
+
+	got := setSecurityEnvVars()
+	if len(got) != 1 || got[0] != "KAFKA_SASL_USER" {
+		t.Errorf("setSecurityEnvVars() = %v, want [KAFKA_SASL_USER]", got)
 	}
 }
 

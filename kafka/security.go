@@ -31,9 +31,34 @@ import (
 	"github.com/xdg-go/scram"
 )
 
+// securityEnvVars are the TLS/SASL settings that only take effect once
+// KAFKA_SECURITY_PROTOCOL selects a matching (SSL / SASL_*) protocol. They are
+// listed here so an unset protocol can warn about the ones a caller set but that
+// are being ignored.
+var securityEnvVars = []string{
+	"KAFKA_TLS_CA_CERT",
+	"KAFKA_TLS_CLIENT_CERT",
+	"KAFKA_TLS_CLIENT_KEY",
+	"KAFKA_TLS_SKIP_VERIFY",
+	"KAFKA_SASL_USER",
+	"KAFKA_SASL_PASSWORD",
+	"KAFKA_SASL_MECHANISM",
+}
+
 func configureSecurity(config *sarama.Config) error {
-	protocol := strings.TrimSpace(os.Getenv("KAFKA_SECURITY_PROTOCOL"))
+	// Uppercase so the protocol enum is matched case-insensitively, consistent
+	// with KAFKA_TLS_SKIP_VERIFY's EqualFold check below.
+	protocol := strings.ToUpper(strings.TrimSpace(os.Getenv("KAFKA_SECURITY_PROTOCOL")))
 	if protocol == "" {
+		// A caller that set TLS/SASL vars but left the protocol unset would
+		// otherwise connect in cleartext with no indication the settings were
+		// dropped. Warn rather than fail so the documented PLAINTEXT default
+		// still works for callers that genuinely want it.
+		if set := setSecurityEnvVars(); len(set) > 0 {
+			log.Warn().
+				Strs("ignored", set).
+				Msg("KAFKA_SECURITY_PROTOCOL is unset; defaulting to PLAINTEXT (cleartext) and ignoring the TLS/SASL settings above. Set KAFKA_SECURITY_PROTOCOL to SSL, SASL_PLAINTEXT, or SASL_SSL to enable them.")
+		}
 		protocol = "PLAINTEXT"
 	}
 
@@ -104,7 +129,9 @@ func configureSASL(config *sarama.Config) error {
 		return fmt.Errorf("KAFKA_SASL_USER and KAFKA_SASL_PASSWORD must both be set when SASL is enabled")
 	}
 
-	mechanism := strings.TrimSpace(os.Getenv("KAFKA_SASL_MECHANISM"))
+	// Uppercase so the mechanism enum is matched case-insensitively, consistent
+	// with the protocol handling in configureSecurity.
+	mechanism := strings.ToUpper(strings.TrimSpace(os.Getenv("KAFKA_SASL_MECHANISM")))
 	if mechanism == "" {
 		mechanism = "PLAIN"
 	}
@@ -150,4 +177,16 @@ func (c *scramClient) Step(challenge string) (string, error) {
 
 func (c *scramClient) Done() bool {
 	return c.conv.Done()
+}
+
+// setSecurityEnvVars returns the names of the securityEnvVars that are set to a
+// non-empty value, in declaration order.
+func setSecurityEnvVars() []string {
+	var set []string
+	for _, name := range securityEnvVars {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			set = append(set, name)
+		}
+	}
+	return set
 }
